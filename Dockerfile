@@ -107,3 +107,6 @@ RUN python3 /tmp/patch_load_pread.py ${SP} && python3 /tmp/patch_moe_name_index.
  && python3 /tmp/patch_embed_chunked_copy.py ${SP} && python3 /tmp/patch_mtp_name_prefilter.py ${SP} \
  && rm /tmp/patch_load_pread.py /tmp/patch_moe_name_index.py /tmp/patch_embed_chunked_copy.py \
        /tmp/patch_mtp_name_prefilter.py
+
+# --- k8s: the converter the prep Job runs (upstream mounts tools/ at run time) ---
+COPY tools/fp8_convert.py /opt/llm/fp8_convert.py
