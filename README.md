@@ -8,7 +8,7 @@ greedy decoding**, and up to **500k tokens of context**.
 The catch this repo solves: the NVFP4 checkpoint is **~125 GiB**, which does not fit
 next to a usable KV cache in the Spark's **128 GB unified pool**. 48 GiB of that is
 the n-gram embedding ("PLE") table — a pure lookup that a token only touches 16 rows
-of. This repo patches the official vLLM v0.30.0 image to **serve that table from NVMe via
+of. This repo patches the official vLLM v0.31.0 image to **serve that table from NVMe via
 `mmap`** instead of keeping it resident. Weights drop to **~75 GiB**, the rest of the
 pool goes to KV, and everything runs on stock GB10 kernels.
 
@@ -37,7 +37,7 @@ be overridden on the command line (`./flash serve default MTP=3 PORT=18301`). `.
 The same thing by hand, unchanged and still supported (everything `flash` does is these scripts):
 
 ```bash
-docker build -t qwen38-flash-dgx:v0.30 .      # official vLLM v0.30.0 image + the patches below
+docker build -t qwen38-flash-dgx:v0.31 .      # official vLLM v0.31.0 image + the patches below
 scripts/download-weights.sh                   # nvidia/Qwen3.8-Flash-Next-NVFP4, ~124 GiB via Xet, resumable (one-time)
 scripts/prepare-hybrid.sh                     # recommended: fp8 side layers, +20% decode, same quality (~10 min, one-time)
 MODE=hybrid YARN=1 CTX=500000 scripts/serve.sh   # the recommended recipe; 500k context, ~3-4 min to load
@@ -109,7 +109,7 @@ Not covered, both deliberate:
   parsed. That is the cost of deciding from the text alone;
   `test_unclosed_fence_suppresses_later_calls` asserts it so a change is deliberate.
 
-The regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.30.0
+The regression patches extend vLLM's Qwen parser tests. To run them from a vLLM v0.31.0
 source checkout with its test dependencies installed (using absolute paths to
 this repository's patch files):
 
@@ -118,6 +118,7 @@ patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qw
 patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-preamble-tests.patch
 patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-marker-guard.patch
 patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-tool-marker-guard-tests.patch
+patch --batch --forward --fuzz=0 -p1 < /path/to/qwen3.8-Flash-DGX/src/patches/qwen-safe-output.patch
 .venv/bin/python -m pytest tests/parser/engine -q
 ```
 
@@ -127,7 +128,54 @@ patch 13. The 9 that pass either way are the no-regression guards — a real cal
 still parses, a real call after a closed fence still parses, and patch 12's own
 inline-quoted-marker case is unchanged.
 
-## Update 2026-09-28 — vLLM v0.30 is the only base
+## Parser and Responses output fixes (issue #31)
+
+New builds include [Chaos2522's output-integrity fixes](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6191209070),
+ported to vLLM v0.31 as patch 19:
+
+- Qwen final parsing retains original token IDs, preserving ordinary text that
+  spells protocol markers instead of treating it as an atomic control token.
+- An empty Responses STOP is reported as a failure instead of a successful empty
+  answer. Streaming uses `response.failed`; nonstreaming returns an HTTP 500 error.
+- A token-limited Responses generation ends with `response.incomplete`, including
+  when the only generated content is hidden reasoning.
+
+Chat Completions keeps incremental tool-argument streaming. Responses buffers
+converted XML arguments until the call closes so truncated calls do not emit
+unfinished JSON. These fixes change parsing and error reporting; they do not
+prevent the model from emitting EOS early.
+
+Validated on GX10: **67/67 targeted methods and 21/21 literal-byte fixtures**,
+no additional failures in 4,782 parser-engine cases, and real-inference checks of
+terminal events and tool round trips. The 55-scenario tournament was used as a
+regression check; its score is not evidence of these bug fixes. See
+[scope and validation](docs/SAFE-OUTPUT.md) and the
+[reproduction suite](tests/issue31_safe_output/README.md).
+
+To update an existing installation, rebuild with
+`docker build -t qwen38-flash-dgx:v0.31 .`, then recreate the container with your
+usual profile and overrides. `./flash setup` reuses an existing v0.31 image and
+does not rebuild it for source-only fixes.
+
+## Update 2026-10-08 — vLLM v0.31 is the current base
+
+The recipe uses the official v0.31.0 image. Existing prepared checkpoints can
+be reused without conversion. Build and run:
+
+```bash
+./flash setup
+./flash serve
+./flash wait
+./flash test
+```
+
+Tested on GX10 with the NVIDIA hybrid checkpoint, MTP=2 and FP8 KV caching:
+the agentic tournament, prefix caching, sequential greedy determinism and
+long-context retrieval at 499,000 input tokens. See the
+[v0.31 validation results](docs/VLLM-031.md#gx10-validation-2026-10-07-to-2026-10-08)
+for quality and performance measurements.
+
+## Update 2026-09-28 — vLLM v0.30 became the stable base
 
 - **One base image, one `Dockerfile`.** It builds the recipe on the vLLM v0.30.0 release
   (`qwen38-flash-dgx:v0.30`) and every profile uses it. v0.30 has run our own box since 2026-09-25:
@@ -623,6 +671,8 @@ mmap patch should apply; we have not booted one ourselves.
 | `CTX` | `262144` | Max context. Native is 262144; with `YARN=1` up to `500000` is validated. |
 | `YARN` | `0` | `1` = YaRN rope scaling (factor 4, Qwen's recipe) for `CTX` > 262144. |
 | `SEQS` | `8` | Max concurrent sequences. **Do not benchmark with 1–2**: excess requests queue silently and aggregate tok/s flatlines (see below). |
+| `CPUSET` | `5-9,15-19` | docker `--cpuset-cpus`: pin the container to specific cores. Default is the 10 Cortex-X5 performance cores on the GB10 — the SGLang recipe for the 27B sibling model pinned its process there and kept it in its measured configs. `CPUSET=` (empty) = all 20 cores. |
+| `MAMBA_SSM_DTYPE` | | `--mamba-ssm-cache-dtype` for the GDN (mamba-style) recurrent state pool. vLLM defaults to `float32`; `bfloat16` halves that pool — on the 27B sibling model 30.9 GB → 15.6 GB at pool 80 — which is what frees the headroom to raise `SEQS`. See [the cross-referenced findings](#tuning-findings-cross-referenced-from-the-27b-sibling-recipe). |
 | `GPU_MEM` | `0.80` | Fraction of the 128 GB pool for weights+KV. `0.85` buys ~2 GiB more KV, but after a day at `0.85` the box drifted into swap, and `0.875` got OOM-killed on a 300k-token prefill with MTP. The lower you set it, the more RAM the page cache has for the 48 GiB table — which is what your prefill speed depends on (below). Right after stopping another big container the first boot can fail with "13.5 GiB KV cache is needed, larger than available" — memory not yet released; the `unless-stopped` retry succeeds. |
 | `MTP` | `2` | Speculative tokens from the model's MTP head (`0` = off). `3` is +7% decode but cost a point at the tournament (44 vs 45/51), so it stays an option. |
 | `KV_DTYPE` | `auto` | `auto` = bf16 (recommended). `fp8_e4m3` = ~1.9× KV pool, 1M context on one box, at −10% decode / −30% prefill and a measurable quality cost — see [fp8 KV cache](docs/HOW-IT-WORKS.md#fp8-kv-cache-on-the-qsa-path-opt-in) before using it. |
@@ -769,6 +819,96 @@ smaller chunks do have one unambiguous benefit: peak swap-out during the prefill
 - The structural way out is a second Spark: the four ConnectX-7 ports exist for that, and
   vLLM's prefill/decode disaggregation puts the prefills on the other box.
 
+### Tuning findings cross-referenced from the 27B sibling recipe
+
+[aphex3k/Qwen3.8-27B-on-DGX-Spark](https://github.com/aphex3k/Qwen3.8-27B-on-DGX-Spark)
+serves the same Qwen3.8 hybrid architecture (GDN + PLE) on this same box, but through
+SGLang instead of vLLM. Its [measured results](https://github.com/aphex3k/Qwen3.8-27B-on-DGX-Spark/blob/main/results/RESULTS.md)
+are the best GB10 data we have on the architecture's concurrency behaviour, so this repo
+ports the findings that have a vLLM equivalent and leaves the rest documented as SGLang-only.
+
+**Ported (this repo):**
+
+- **Concurrency headroom** — the sibling sweep showed aggregate throughput tracks the
+  running-request cap, not the hardware: at the shipped cap of 4, 4 → 8 streams gained
+  only 2%; at cap 16 the peak reached 480.7 tok/s (vs 190.1 at cap 8). The equivalent
+  knob here is `SEQS` (`--max-num-seqs`): the `concurrent` profile raises it to 16 for
+  aggregate-throughput runs. This matches what the @jschmied sweep above already showed
+  for this model.
+- **`MAMBA_SSM_DTYPE=bfloat16`** — the sibling's `--mamba-ssm-dtype bfloat16` halves the
+  GDN state pool (30.9 GB → 15.6 GB at pool 80; float32 is the engine default). The vLLM
+  equivalent, `--mamba-ssm-cache-dtype`, is exposed as `MAMBA_SSM_DTYPE` and set by the
+  `concurrent` profile. The Flash model's pool is much smaller than the 27B's, but the
+  same principle applies: halving the pool is free KV/page-cache headroom.
+- **`CPUSET=5-9,15-19`** — the sibling pinned SGLang to the 10 Cortex-X5 performance
+  cores and kept it in every measured config. Exposed as `CPUSET` → docker
+  `--cpuset-cpus` and pinned by default for the same reason; `CPUSET=` (empty) runs
+  the container on all 20 cores. We did not measure a delta on this model yet, so
+  treat the pin as an unverified port until A/B'd.
+
+**SGLang-specific (not ported, no vLLM equivalent in v0.30):**
+
+- `--max-mamba-cache-size` / `--max-running-requests` / `--cuda-graph-max-bs-decode` —
+  SGLang sizes the mamba pool and the running-request cap as separate flags; vLLM sizes
+  the GDN pool from the remaining memory and caps concurrency with `--max-num-seqs` alone.
+- `--mamba-full-memory-ratio` and `--mamba-radix-cache-strategy` — SGLang scheduler
+  internals with no vLLM flag.
+- `--speculative-num-draft-tokens` — the sibling found draft=16 gives +28–41%
+  single-stream but −10–15% aggregate, and that every draft token is verified so quality
+  is unaffected. vLLM's MTP knob is `num_speculative_tokens` (`MTP=`), which is not the
+  same dial; `MTP=3` is what we validated here (+7% decode, −1 tournament point), so the
+  wider-window finding is recorded for context, not wired up.
+- `--mem-fraction-static 0.85` — the sibling's settled value; our `GPU_MEM` already
+  covers this and its own measurements (0.80 stable, 0.875 OOM) are documented above.
+
+**Measurement caveats that also apply here** — the sibling's results document the traps it hit (boot-to-boot variance, greedy non-determinism, truncation reading as a quality regression); the [Benchmarking](#benchmarking) section below restates them as this repo's hygiene rules.
+
+## Benchmarking
+
+`bench/` is a self-contained suite that measures this recipe the same way the
+[Qwen3.8-27B-on-DGX-Spark](https://github.com/aphex3k/Qwen3.8-27B-on-DGX-Spark/results/RESULTS.md)
+recipe was measured on the same hardware, so the two can be compared head to head:
+
+```bash
+export GB10_BASE_URL=http://127.0.0.1:18300/v1   # wherever `./flash serve` listens
+export GB10_MODEL=qwen3.8-flash-next
+
+python3 bench/perf.py             # TTFT, single-stream decode, concurrency sweep, prefill curve
+python3 bench/longctx.py          # concurrent long-context; unique content per stream
+./scripts/run-humaneval.sh        # HumanEval pass@1, thinking off (~5 min)
+./scripts/run-humaneval.sh think  # thinking on (~20 min)
+```
+
+Everything is env-driven (`GB10_BASE_URL`, `GB10_API_KEY`, `GB10_MODEL` — see
+`bench/common.py`) and the scripts are self-locating, so nothing is path-dependent.
+HumanEval needs one-time setup on the box:
+`python3 -m pip install --user pandas pyarrow huggingface_hub`; the dataset lands in
+`data/humaneval`, results in `results/` (both gitignored), and candidates are executed
+against their real unit tests in a `--network none` `python:3.12-slim` container.
+Thinking is toggled through the checkpoint's `reasoning_effort` template argument
+(`low` off, `xhigh` on — override with `GB10_REASONING_OFF` / `GB10_REASONING_ON`).
+
+Measurement hygiene — each of these has produced a wrong number before:
+
+- **Run on an idle box.** Any competing GPU work skews every figure.
+- **Boot-to-boot single-stream variance is ~8%**, against <2% run-to-run within one
+  instance. Size A/B deltas against that band; re-measure a small win on a fresh boot.
+- **Greedy is not bitwise-stable across batch shapes** (see the deterministic top-k
+  section); treat a pass@1 delta of ±2 HumanEval problems as noise.
+- **Truncation reads as a quality regression.** A capped `max_tokens` truncates
+  thinking runs; check `finish_reason == "length"` before quoting a score.
+  `run-humaneval.sh` reports truncated problems separately from real failures.
+- **Count `completion_tokens`, not stream events** — speculative decoding emits
+  several tokens per event.
+- **Long-context concurrency:** give every stream *unique* content, or the prefix cache
+  deduplicates it and you measure cache hits instead of KV capacity. Prefill
+  serialises, so read seconds-per-stream, not aggregate tok/s.
+- **Concurrency sweep:** raise `SEQS` to at least the highest stream count you sweep,
+  or excess requests queue silently and the aggregate flatlines (see above).
+- **Health probes:** a model saturated on long prefills is healthy but too busy to
+  answer a 5 s probe. If a supervisor watches the server, use ≥30 s timeouts or it will
+  restart a healthy, busy server mid-job.
+
 ## How it fits — the one idea
 
 A token's n-gram lookup reads **16 rows × 160 bytes ≈ 2.5 KB**. Over a 20k-token
@@ -834,7 +974,7 @@ Details: [results-radixark-vllm.md](https://github.com/jschmied/qwen38-flash-nex
 ```
 flash                             one-command front-end: doctor / setup / serve <profile> / wait / test / status …
 profiles/*.env                    named recipes for it (default, speed, context, context-1m, shared, published, native)
-Dockerfile                        official vLLM v0.30.0 image + the patches below (qwen38-flash-dgx:v0.30).
+Dockerfile                        official vLLM v0.31.0 image + the patches below (qwen38-flash-dgx:v0.31).
                                      Gaps in the numbering are upstream now: 3, 9, 11 (docs/HISTORY.md)
 src/vllm_ple_mmap.py              1. mmap PLE table (opaque op, breaks the CUDA-graph capture)  VLLM_PLE_MMAP=1
 src/patch_mamba_block_size.py     4. prefix-caching block_size fix
@@ -850,6 +990,7 @@ src/patch_qsa_fp8_kv.py           7. fp8_e4m3 KV cache on the QSA path (by @Nane
 src/patch_moe_load_clone.py      14. clone mmap-backed expert weights before the H2D copy          VLLM_LOAD_CLONE=0 disables
                                      (main weight load 541 -> 150 s on a Spark; docs/HOW-IT-WORKS.md)
 src/patches/qwen-tool-*.patch    12, 13. Qwen tool-marker fixes in the parser engine (+ their test modules)
+src/patches/qwen-safe-output.patch 19. Qwen token identity, empty STOP failures and Responses terminal events
 src/patch_load_pread.py          15. pread checkpoint tensors <= 64 MiB instead of mmap views     VLLM_LOAD_PREAD=0 disables
                                      (never the PLE table; needs 14)
 src/patch_moe_name_index.py      16. indexed FusedMoE expert-name matching (~30 s of Python)        VLLM_MOE_NAME_INDEX=0 disables
@@ -873,6 +1014,8 @@ tools/vllm_watch.py               live per-session view of prompts / reasoning /
 scripts/serve.sh                  MODE=nvfp4|hybrid|hybrid-mtp, SERVED_MODEL_NAME, PREFIX_CACHE, DET_TOPK, DRAFT_VOCAB, MADVISE, EXACT_TOPK, KV_DTYPE, YARN, ...
 scripts/smoke-test.sh             health, coherence, prefix-cache hit, determinism, tok/s
 scripts/greedy-probe.sh           greedy probe set; diff two arms to gate a draft/checkpoint swap
+scripts/run-humaneval.sh          HumanEval end-to-end: generate -> sandboxed execution -> report
+bench/                            perf.py (TTFT/decode/concurrency/prefill), longctx.py, humaneval/ — the benchmark suite
 docs/HOW-IT-WORKS.md              how each patch works, with the measurements
 docs/HISTORY.md                   the earlier updates and the preview / v0.29 bases
 ```
@@ -880,9 +1023,9 @@ docs/HISTORY.md                   the earlier updates and the preview / v0.29 ba
 Run the unit tests (no GPU):
 
 ```bash
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_ple_mmap_cpu.py
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_qsa_exact_topk_cpu.py
-docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.30 test_moe_name_index_cpu.py
+docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.31 test_ple_mmap_cpu.py
+docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.31 test_qsa_exact_topk_cpu.py
+# test_moe_name_index_cpu.py exercises the retired local patch, not v0.31's native index.
 ```
 
 ## Limitations & notes
@@ -911,6 +1054,7 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.
 - `COMPILE_CACHE`, the persistent compile cache: **[@AronRubin](https://github.com/AronRubin)** (PR #21).
 - The pointer to NVIDIA's own NVFP4 checkpoint: **[@PathosEthosLogos](https://github.com/PathosEthosLogos)** (issue #17).
 - `tools/vllm_watch.py`, the live session viewer: **[@0x3dlux](https://github.com/0x3dlux)** (issue #12).
+- Qwen token-identity and Responses output-integrity fixes (patch 19), with the source bundle and regression fixtures: **[@Chaos2522](https://github.com/Chaos2522)** ([issue #31](https://github.com/blazux/qwen3.8-Flash-DGX/issues/31#issuecomment-6191209070)); adapted here for vLLM v0.31.
 - The nudge to port the recipe to the vLLM releases (v0.29, then v0.30): **[@ChengYen-Tang](https://github.com/ChengYen-Tang)** (issue #14).
 
 - The two ideas behind the reduced draft vocabulary and the `MADV_RANDOM` table advice come
@@ -923,7 +1067,7 @@ docker run --rm -v "$PWD/src:/t" -w /t --entrypoint python3 qwen38-flash-dgx:v0.
 - NVFP4 MTP draft experts (the `hybrid-mtp` graft donor): **[Inferact/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/Inferact/Qwen3.8-Flash-Next-NVFP4)**; the graft recipe follows
   [thavoc's graft write-up](https://gist.github.com/thavoc/d7083457f6f2d981f879670c34df34ab)
   and [Peuqui/mtp-quant-transplant](https://github.com/Peuqui/mtp-quant-transplant).
-- Serving engine and base image: **vLLM** (`vllm/vllm-openai:v0.30.0`; the model's support started as
+- Serving engine and base image: **vLLM** (`vllm/vllm-openai:v0.31.0`; the model's support started as
   the `release/qwen38next` recipe / PR #53896); the Mamba state-copy race fix is
   [vllm#50729](https://github.com/vllm-project/vllm/pull/50729) by **@AndreasKaratzas**.
 - GB10 FLA fixes, the faster PLE gather, the state-copy guard and the fp8 side-layer
