@@ -1,0 +1,56 @@
+{
+  "vllm_version": "0.33.0",
+  "upstream_tag": "v0.33.0rc3",
+  "installed_files": [
+    {
+      "path": "vllm/entrypoints/openai/responses/protocol.py",
+      "base_sha256": "094ca93053143933b765fb0e21d38d452eeaee5b7e288802685c673221de54b7",
+      "target_sha256": "0c82e0094a010ec1cb93b4c25f639a819d25f7af451fd75d13d02ab6380fa5bf"
+    },
+    {
+      "path": "vllm/entrypoints/openai/responses/serving.py",
+      "base_sha256": "53869457dcc1767f9848fd1b8bdd257dca12982b7eebcc8568c2043e3e501945",
+      "target_sha256": "f026734593fd3244c5694474934f90e25e3afc1cad61f156ae4bc9a8789bc6af"
+    },
+    {
+      "path": "vllm/parser/abstract_parser.py",
+      "base_sha256": "050234f75f7406e2368b54ecbad95c5efe79fc8437afb2b0e515e571f5d6e311",
+      "target_sha256": "a2cbceda4daa3b8ac2500596705b25ebec16555565d74cd563f6b41fe188866b"
+    },
+    {
+      "path": "vllm/parser/engine/adapters.py",
+      "base_sha256": "1b94403f8f21346f380adfccb9bbec9b4b87acd1ce4c2b41b51acdca5434d028",
+      "target_sha256": "859ff0a4e66d16c720edee629eb0466293b7ab927eb1c3ae8168f86829fe9678"
+    },
+    {
+      "path": "vllm/parser/engine/argument_validation.py",
+      "base_sha256": null,
+      "target_sha256": "b19f87e30239a5912d18053ba1c3428218d8e3849daa165182baf09bf1aafbcb"
+    },
+    {
+      "path": "vllm/parser/engine/parser_engine.py",
+      "base_sha256": "5bddf64c26e09f50810a4041bf3d082c3cf101cb729f5a0020129f8a9e33ec46",
+      "target_sha256": "702aa52dcb5a1887fe55872f108c45cdf6e868e85e2935b03937b79a22029430"
+    },
+    {
+      "path": "vllm/parser/engine/parser_engine_config.py",
+      "base_sha256": "5559a32c88ffe657c2301f449d1fdbd503e76f755111d34e8bb05e4d65a7405e",
+      "target_sha256": "89dbccf01d63a200526f85a1f6271c7d30fe41dcd898c6916c4d21a2b4138ff9"
+    },
+    {
+      "path": "vllm/parser/engine/streaming_parser_engine.py",
+      "base_sha256": "57cbafdc8586a33fb45b2a0e22dd04dd73ed8bb3c3fe71591d785d120e9f8a6e",
+      "target_sha256": "2629b370ad564aace8239274f74979440a18e4313e0eef1ac92d9d8fd424569b"
+    },
+    {
+      "path": "vllm/parser/nemotron_v3.py",
+      "base_sha256": "8ea9bbc5f4751f96edaf00bc785b4bc0c7f5f61a959978e028b1db152cab4c2f",
+      "target_sha256": "e77d7cd4972d5e82dbf4c119d2345ba431fcf9f5339b9eff4c26a1a827e079c3"
+    },
+    {
+      "path": "vllm/parser/qwen3.py",
+      "base_sha256": "629bdc9c5b4b4206b4c2d50e34e8c557061ed8091524a80bd62c6c4dc19ec5a4",
+      "target_sha256": "58611ac31d57176e7bb4e1923eb0ba2155e8b4ef5457dc42790df7be8ec5c5f0"
+    }
+  ]
+}
